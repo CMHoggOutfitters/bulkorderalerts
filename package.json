@@ -1,14 +1,10 @@
 {
   "name": "reamaze-bulk-alert",
-  "version": "1.0.0",
-  "description": "Webhook server: detects bulk order inquiries in Re:amaze and pings Slack immediately",
+  "version": "2.0.0",
+  "description": "Polls Re:amaze API and sends Slack alerts for bulk order inquiries",
   "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2"
+    "start": "node index.js"
   },
   "engines": {
     "node": ">=18.0.0"
