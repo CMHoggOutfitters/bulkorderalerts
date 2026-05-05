@@ -1,195 +1,181 @@
-const express = require("express");
-const crypto = require("crypto");
+// ── Re:amaze → Slack bulk-order alert poller ─────────────────────────────────
+// Polls the Re:amaze API every POLL_INTERVAL_SECONDS for new customer messages.
+// If a message body matches any BULK_KEYWORDS, fires a Slack alert.
+// Confirmed against docs: https://www.reamaze.com/api/get_messages
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const http = require("http");
 
-// ── Keywords that trigger a bulk/large order alert ──────────────────────────
+// ── Config (from env vars) ───────────────────────────────────────────────────
+const REAMAZE_BRAND          = process.env.REAMAZE_BRAND;          // e.g. "hoggoutdoorproducts"
+const REAMAZE_LOGIN_EMAIL    = process.env.REAMAZE_LOGIN_EMAIL;    // your login email
+const REAMAZE_API_TOKEN      = process.env.REAMAZE_API_TOKEN;      // from Settings → Developer → API Token
+const SLACK_WEBHOOK_URL      = process.env.SLACK_WEBHOOK_URL;      // Slack incoming webhook
+const POLL_INTERVAL_SECONDS  = parseInt(process.env.POLL_INTERVAL_SECONDS || "60", 10);
+const PORT                   = process.env.PORT || 3000;
+
+const REQUIRED = { REAMAZE_BRAND, REAMAZE_LOGIN_EMAIL, REAMAZE_API_TOKEN, SLACK_WEBHOOK_URL };
+for (const [k, v] of Object.entries(REQUIRED)) {
+  if (!v) { console.error(`❌ Missing required env var: ${k}`); process.exit(1); }
+}
+
+// ── Bulk keywords (case-insensitive substring match) ─────────────────────────
 const BULK_KEYWORDS = [
-  // quantity signals
   "bulk", "wholesale", "large order", "big order", "mass order",
   "volume order", "volume discount", "large quantity", "large quantities",
   "bulk order", "bulk purchase", "bulk pricing", "bulk price",
-  // number signals  
   "100 units", "200 units", "500 units", "1000 units",
   "dozen", "gross", "pallet", "pallets", "case of", "cases of",
-  // intent signals
   "corporate order", "company order", "business order",
   "reseller", "distributor", "distributor pricing",
   "for my business", "for our business", "for our company",
   "for my store", "for our store", "for resale",
   "can you accommodate", "can you handle",
-  // quantity words
   "hundreds", "thousands", "multiple cases",
 ];
 
-// ── Raw body needed for signature verification ───────────────────────────────
-app.use(express.json({
-  verify: (req, _res, buf) => { req.rawBody = buf; }
-}));
+// ── State: track seen message IDs so we don't alert twice ────────────────────
+const seenMessageIds = new Set();
+let isFirstPoll = true;
 
-// ── Health check ─────────────────────────────────────────────────────────────
-app.get("/", (_req, res) => res.json({ status: "ok", service: "reamaze-bulk-alert" }));
+// ── Re:amaze API: list recent customer messages ──────────────────────────────
+async function fetchRecentMessages() {
+  const url = `https://${REAMAZE_BRAND}.reamaze.io/api/v1/messages?filter=customer`;
+  const auth = Buffer.from(`${REAMAZE_LOGIN_EMAIL}:${REAMAZE_API_TOKEN}`).toString("base64");
 
-// ── Webhook endpoint ──────────────────────────────────────────────────────────
-app.post("/webhook", async (req, res) => {
-  // 1. Verify Re:amaze signature (optional but recommended)
-  const secret = process.env.REAMAZE_WEBHOOK_SECRET;
-  if (secret) {
-    const sig = req.headers["x-reamaze-signature"] || req.headers["x-hub-signature-256"] || "";
-    const expected = "sha256=" + crypto
-      .createHmac("sha256", secret)
-      .update(req.rawBody)
-      .digest("hex");
-    if (sig !== expected) {
-      console.warn("⚠️  Signature mismatch — ignoring webhook");
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-  }
-
-  const payload = req.body;
-
-  // 2. Extract the message text from Re:amaze's payload structure
-  const messageBody = extractMessageText(payload);
-  const conversationUrl = extractConversationUrl(payload);
-  const customerName = extractCustomerName(payload);
-  const customerEmail = extractCustomerEmail(payload);
-  const subject = payload?.conversation?.subject || payload?.message?.subject || "(no subject)";
-
-  if (!messageBody) {
-    return res.json({ status: "ignored", reason: "no message body found" });
-  }
-
-  // 3. Check for bulk keywords
-  const lowerBody = messageBody.toLowerCase();
-  const matched = BULK_KEYWORDS.filter(kw => lowerBody.includes(kw.toLowerCase()));
-
-  if (matched.length === 0) {
-    console.log(`📨 Message received — no bulk keywords found`);
-    return res.json({ status: "ignored", reason: "no bulk keywords" });
-  }
-
-  console.log(`🚨 Bulk keywords detected: ${matched.join(", ")}`);
-
-  // 4. Fire Slack alert
-  await sendSlackAlert({
-    customerName,
-    customerEmail,
-    subject,
-    messageBody,
-    conversationUrl,
-    matchedKeywords: matched,
+  const res = await fetch(url, {
+    headers: {
+      "Accept": "application/json",
+      "Authorization": `Basic ${auth}`,
+    },
   });
 
-  res.json({ status: "alerted", keywords: matched });
-});
-
-// ── Extract helpers ───────────────────────────────────────────────────────────
-function extractMessageText(payload) {
-  return (
-    payload?.message?.body ||
-    payload?.message?.body_text ||
-    payload?.conversation?.last_message?.body ||
-    payload?.note?.body ||
-    ""
-  );
-}
-
-function extractConversationUrl(payload) {
-  const slug = process.env.REAMAZE_BRAND_SLUG || "your-brand";
-  const convId = payload?.conversation?.slug || payload?.conversation?.id || "";
-  return convId
-    ? `https://${slug}.reamaze.com/conversations/${convId}`
-    : "https://app.reamaze.com";
-}
-
-function extractCustomerName(payload) {
-  return (
-    payload?.conversation?.customer?.name ||
-    payload?.message?.customer?.name ||
-    payload?.customer?.name ||
-    "Unknown Customer"
-  );
-}
-
-function extractCustomerEmail(payload) {
-  return (
-    payload?.conversation?.customer?.email ||
-    payload?.message?.customer?.email ||
-    payload?.customer?.email ||
-    ""
-  );
-}
-
-// ── Slack alert ───────────────────────────────────────────────────────────────
-async function sendSlackAlert({ customerName, customerEmail, subject, messageBody, conversationUrl, matchedKeywords }) {
-  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
-  if (!webhookUrl) {
-    console.error("❌ SLACK_WEBHOOK_URL not set");
-    return;
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Re:amaze API ${res.status}: ${body.slice(0, 300)}`);
   }
+  const data = await res.json();
+  return data.messages || [];
+}
 
-  // Trim message preview to ~300 chars
-  const preview = messageBody.length > 300
-    ? messageBody.slice(0, 297) + "..."
-    : messageBody;
+// ── Check if message body has any bulk keyword ───────────────────────────────
+function findKeywords(body) {
+  if (!body) return [];
+  const lower = body.toLowerCase();
+  return BULK_KEYWORDS.filter(kw => lower.includes(kw.toLowerCase()));
+}
+
+// ── Slack alert ──────────────────────────────────────────────────────────────
+async function sendSlackAlert({ message, matchedKeywords }) {
+  const conv = message.conversation || {};
+  const user = message.user || {};
+  const subject = conv.subject || "(no subject)";
+  const customerName = user.name || "Unknown";
+  const customerEmail = user.email || "—";
+  const slug = conv.slug || "";
+  const conversationUrl = slug
+    ? `https://${REAMAZE_BRAND}.reamaze.com/admin/conversations/${slug}`
+    : `https://${REAMAZE_BRAND}.reamaze.com`;
+  const body = (message.body || "").replace(/<[^>]+>/g, ""); // strip any HTML
+  const preview = body.length > 400 ? body.slice(0, 397) + "..." : body;
 
   const payload = {
-    text: `🚨 *Bulk Order Inquiry Detected!*`,
+    text: "🚨 Bulk Order Inquiry Detected!",
     blocks: [
-      {
-        type: "header",
-        text: {
-          type: "plain_text",
-          text: "🚨 Bulk Order Inquiry",
-          emoji: true,
-        },
-      },
+      { type: "header", text: { type: "plain_text", text: "🚨 Bulk Order Inquiry", emoji: true } },
       {
         type: "section",
         fields: [
           { type: "mrkdwn", text: `*Customer:*\n${customerName}` },
-          { type: "mrkdwn", text: `*Email:*\n${customerEmail || "—"}` },
+          { type: "mrkdwn", text: `*Email:*\n${customerEmail}` },
           { type: "mrkdwn", text: `*Subject:*\n${subject}` },
-          { type: "mrkdwn", text: `*Keywords found:*\n${matchedKeywords.map(k => `\`${k}\``).join(", ")}` },
+          { type: "mrkdwn", text: `*Keywords:*\n${matchedKeywords.map(k => `\`${k}\``).join(", ")}` },
         ],
       },
       {
         type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*Message preview:*\n>${preview.replace(/\n/g, "\n>")}`,
-        },
+        text: { type: "mrkdwn", text: `*Message preview:*\n>${preview.replace(/\n/g, "\n>")}` },
       },
       {
         type: "actions",
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "Open in Re:amaze →", emoji: true },
-            url: conversationUrl,
-            style: "primary",
-          },
-        ],
+        elements: [{
+          type: "button",
+          text: { type: "plain_text", text: "Open in Re:amaze →", emoji: true },
+          url: conversationUrl,
+          style: "primary",
+        }],
       },
     ],
   };
 
-  const response = await fetch(webhookUrl, {
+  const res = await fetch(SLACK_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  if (!response.ok) {
-    console.error("❌ Slack webhook failed:", response.status, await response.text());
+  if (!res.ok) {
+    console.error(`❌ Slack webhook ${res.status}:`, await res.text());
   } else {
-    console.log("✅ Slack alert sent!");
+    console.log("✅ Slack alert sent");
   }
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 Re:amaze bulk alert server running on port ${PORT}`);
-  console.log(`   Watching for ${BULK_KEYWORDS.length} bulk/order keywords`);
+// ── Main poll loop ───────────────────────────────────────────────────────────
+async function pollOnce() {
+  try {
+    const messages = await fetchRecentMessages();
+    let newCount = 0, matchedCount = 0;
+
+    for (const msg of messages) {
+      // Use origin_id (or created_at + body as fallback) as a stable identifier
+      const id = msg.origin_id || `${msg.created_at}::${(msg.body || "").slice(0, 50)}`;
+      if (seenMessageIds.has(id)) continue;
+      seenMessageIds.add(id);
+      newCount++;
+
+      // First poll: just record everything as seen, don't alert (avoids alert
+      // storm on cold start for any old messages still containing keywords).
+      if (isFirstPoll) continue;
+
+      const matches = findKeywords(msg.body);
+      if (matches.length > 0) {
+        matchedCount++;
+        console.log(`🚨 Match: ${matches.join(", ")} — from ${msg.user?.email || "?"}`);
+        await sendSlackAlert({ message: msg, matchedKeywords: matches });
+      }
+    }
+
+    // Cap memory: keep the set from growing forever
+    if (seenMessageIds.size > 5000) {
+      const arr = Array.from(seenMessageIds);
+      seenMessageIds.clear();
+      arr.slice(-2500).forEach(id => seenMessageIds.add(id));
+    }
+
+    if (isFirstPoll) {
+      console.log(`📋 First poll: recorded ${newCount} existing messages (no alerts sent)`);
+      isFirstPoll = false;
+    } else if (newCount > 0) {
+      console.log(`📨 Poll: ${newCount} new message(s), ${matchedCount} matched`);
+    }
+  } catch (err) {
+    console.error("❌ Poll error:", err.message);
+  }
+}
+
+// ── Tiny health-check server (so Railway sees the service as up) ─────────────
+http.createServer((_req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    status: "ok",
+    seenIds: seenMessageIds.size,
+    pollIntervalSeconds: POLL_INTERVAL_SECONDS,
+  }));
+}).listen(PORT, () => {
+  console.log(`🚀 Health server on port ${PORT}`);
 });
+
+// ── Start polling ────────────────────────────────────────────────────────────
+console.log(`🔁 Polling Re:amaze brand "${REAMAZE_BRAND}" every ${POLL_INTERVAL_SECONDS}s`);
+console.log(`   Watching for ${BULK_KEYWORDS.length} keywords`);
+pollOnce();
+setInterval(pollOnce, POLL_INTERVAL_SECONDS * 1000);
