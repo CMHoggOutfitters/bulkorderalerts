@@ -2,7 +2,7 @@
   "name": "reamaze-bulk-alert",
   "version": "1.0.0",
   "description": "Webhook server: detects bulk order inquiries in Re:amaze and pings Slack immediately",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
