@@ -6,10 +6,11 @@
 const http = require("http");
 
 // ── Config (from env vars) ───────────────────────────────────────────────────
-const REAMAZE_BRAND          = process.env.REAMAZE_BRAND;          // e.g. "hoggoutdoorproducts"
+const REAMAZE_BRAND          = process.env.REAMAZE_BRAND;          // e.g. "wholesale-hogg"
 const REAMAZE_LOGIN_EMAIL    = process.env.REAMAZE_LOGIN_EMAIL;    // your login email
 const REAMAZE_API_TOKEN      = process.env.REAMAZE_API_TOKEN;      // from Settings → Developer → API Token
 const SLACK_WEBHOOK_URL      = process.env.SLACK_WEBHOOK_URL;      // Slack incoming webhook
+const SLACK_MENTION_USER_ID  = process.env.SLACK_MENTION_USER_ID;  // Optional: Slack member ID(s) to @mention. Comma-separate for multiple.
 const POLL_INTERVAL_SECONDS  = parseInt(process.env.POLL_INTERVAL_SECONDS || "60", 10);
 const PORT                   = process.env.PORT || 3000;
 
@@ -36,6 +37,17 @@ const BULK_KEYWORDS = [
 // ── State: track seen message IDs so we don't alert twice ────────────────────
 const seenMessageIds = new Set();
 let isFirstPoll = true;
+
+// ── Build the @mention prefix from SLACK_MENTION_USER_ID ─────────────────────
+function buildMentionPrefix() {
+  if (!SLACK_MENTION_USER_ID) return "";
+  // Support comma-separated list of IDs and special tokens like "channel" / "here"
+  const ids = SLACK_MENTION_USER_ID.split(",").map(s => s.trim()).filter(Boolean);
+  return ids.map(id => {
+    if (id === "channel" || id === "here") return `<!${id}>`;
+    return `<@${id}>`;
+  }).join(" ") + " ";
+}
 
 // ── Re:amaze API: list recent customer messages ──────────────────────────────
 async function fetchRecentMessages() {
@@ -78,9 +90,15 @@ async function sendSlackAlert({ message, matchedKeywords }) {
   const body = (message.body || "").replace(/<[^>]+>/g, ""); // strip any HTML
   const preview = body.length > 400 ? body.slice(0, 397) + "..." : body;
 
+  const mention = buildMentionPrefix();
+
   const payload = {
-    text: "🚨 Bulk Order Inquiry Detected!",
+    text: `${mention}🚨 Bulk Order Inquiry Detected!`,
     blocks: [
+      ...(mention ? [{
+        type: "section",
+        text: { type: "mrkdwn", text: `${mention.trim()} 👈 heads up!` },
+      }] : []),
       { type: "header", text: { type: "plain_text", text: "🚨 Bulk Order Inquiry", emoji: true } },
       {
         type: "section",
@@ -169,6 +187,7 @@ http.createServer((_req, res) => {
     status: "ok",
     seenIds: seenMessageIds.size,
     pollIntervalSeconds: POLL_INTERVAL_SECONDS,
+    mentionConfigured: !!SLACK_MENTION_USER_ID,
   }));
 }).listen(PORT, () => {
   console.log(`🚀 Health server on port ${PORT}`);
@@ -177,5 +196,6 @@ http.createServer((_req, res) => {
 // ── Start polling ────────────────────────────────────────────────────────────
 console.log(`🔁 Polling Re:amaze brand "${REAMAZE_BRAND}" every ${POLL_INTERVAL_SECONDS}s`);
 console.log(`   Watching for ${BULK_KEYWORDS.length} keywords`);
+if (SLACK_MENTION_USER_ID) console.log(`   Will @mention: ${SLACK_MENTION_USER_ID}`);
 pollOnce();
 setInterval(pollOnce, POLL_INTERVAL_SECONDS * 1000);
