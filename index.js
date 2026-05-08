@@ -34,6 +34,20 @@ const BULK_KEYWORDS = [
   "hundreds", "thousands", "multiple cases",
 ];
 
+// ── Exclusions: skip these messages even if keywords match ───────────────────
+// Subjects (case-insensitive substring match — "matches" means contains)
+const EXCLUDED_SUBJECTS = [
+  "notification of payment received",
+];
+
+// Email domains (case-insensitive). Strip the @ — just the domain.
+const EXCLUDED_DOMAINS = [
+  "hoggoutfitters.com",
+  "backinstock.org",
+  "rangeme.com",
+  "mg.postscriptapp.com",
+];
+
 // ── State: track seen message IDs so we don't alert twice ────────────────────
 const seenMessageIds = new Set();
 let isFirstPoll = true;
@@ -41,7 +55,6 @@ let isFirstPoll = true;
 // ── Build the @mention prefix from SLACK_MENTION_USER_ID ─────────────────────
 function buildMentionPrefix() {
   if (!SLACK_MENTION_USER_ID) return "";
-  // Support comma-separated list of IDs and special tokens like "channel" / "here"
   const ids = SLACK_MENTION_USER_ID.split(",").map(s => s.trim()).filter(Boolean);
   return ids.map(id => {
     if (id === "channel" || id === "here") return `<!${id}>`;
@@ -76,6 +89,28 @@ function findKeywords(body) {
   return BULK_KEYWORDS.filter(kw => lower.includes(kw.toLowerCase()));
 }
 
+// ── Check if message should be excluded based on subject or sender ───────────
+// Returns the exclusion reason as a string, or null if not excluded.
+function getExclusionReason(message) {
+  const subject = (message.conversation?.subject || "").toLowerCase();
+  for (const sub of EXCLUDED_SUBJECTS) {
+    if (subject.includes(sub.toLowerCase())) {
+      return `subject contains "${sub}"`;
+    }
+  }
+
+  const email = (message.user?.email || "").toLowerCase();
+  for (const domain of EXCLUDED_DOMAINS) {
+    // Match if email ends with @domain (exact domain) or with .domain (subdomains)
+    const d = domain.toLowerCase();
+    if (email.endsWith("@" + d) || email.endsWith("." + d)) {
+      return `sender domain "${d}"`;
+    }
+  }
+
+  return null;
+}
+
 // ── Slack alert ──────────────────────────────────────────────────────────────
 async function sendSlackAlert({ message, matchedKeywords }) {
   const conv = message.conversation || {};
@@ -87,7 +122,7 @@ async function sendSlackAlert({ message, matchedKeywords }) {
   const conversationUrl = slug
     ? `https://${REAMAZE_BRAND}.reamaze.com/admin/conversations/${slug}`
     : `https://${REAMAZE_BRAND}.reamaze.com`;
-  const body = (message.body || "").replace(/<[^>]+>/g, ""); // strip any HTML
+  const body = (message.body || "").replace(/<[^>]+>/g, "");
   const preview = body.length > 400 ? body.slice(0, 397) + "..." : body;
 
   const mention = buildMentionPrefix();
@@ -141,28 +176,32 @@ async function sendSlackAlert({ message, matchedKeywords }) {
 async function pollOnce() {
   try {
     const messages = await fetchRecentMessages();
-    let newCount = 0, matchedCount = 0;
+    let newCount = 0, matchedCount = 0, excludedCount = 0;
 
     for (const msg of messages) {
-      // Use origin_id (or created_at + body as fallback) as a stable identifier
       const id = msg.origin_id || `${msg.created_at}::${(msg.body || "").slice(0, 50)}`;
       if (seenMessageIds.has(id)) continue;
       seenMessageIds.add(id);
       newCount++;
 
-      // First poll: just record everything as seen, don't alert (avoids alert
-      // storm on cold start for any old messages still containing keywords).
       if (isFirstPoll) continue;
 
       const matches = findKeywords(msg.body);
-      if (matches.length > 0) {
-        matchedCount++;
-        console.log(`🚨 Match: ${matches.join(", ")} — from ${msg.user?.email || "?"}`);
-        await sendSlackAlert({ message: msg, matchedKeywords: matches });
+      if (matches.length === 0) continue;
+
+      // Check exclusions BEFORE sending the alert
+      const exclusionReason = getExclusionReason(msg);
+      if (exclusionReason) {
+        excludedCount++;
+        console.log(`🛑 Excluded match (${exclusionReason}) — would have matched: ${matches.join(", ")}`);
+        continue;
       }
+
+      matchedCount++;
+      console.log(`🚨 Match: ${matches.join(", ")} — from ${msg.user?.email || "?"}`);
+      await sendSlackAlert({ message: msg, matchedKeywords: matches });
     }
 
-    // Cap memory: keep the set from growing forever
     if (seenMessageIds.size > 5000) {
       const arr = Array.from(seenMessageIds);
       seenMessageIds.clear();
@@ -173,14 +212,14 @@ async function pollOnce() {
       console.log(`📋 First poll: recorded ${newCount} existing messages (no alerts sent)`);
       isFirstPoll = false;
     } else if (newCount > 0) {
-      console.log(`📨 Poll: ${newCount} new message(s), ${matchedCount} matched`);
+      console.log(`📨 Poll: ${newCount} new, ${matchedCount} alerted, ${excludedCount} excluded`);
     }
   } catch (err) {
     console.error("❌ Poll error:", err.message);
   }
 }
 
-// ── Tiny health-check server (so Railway sees the service as up) ─────────────
+// ── Tiny health-check server ─────────────────────────────────────────────────
 http.createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
@@ -188,6 +227,8 @@ http.createServer((_req, res) => {
     seenIds: seenMessageIds.size,
     pollIntervalSeconds: POLL_INTERVAL_SECONDS,
     mentionConfigured: !!SLACK_MENTION_USER_ID,
+    excludedSubjects: EXCLUDED_SUBJECTS.length,
+    excludedDomains: EXCLUDED_DOMAINS.length,
   }));
 }).listen(PORT, () => {
   console.log(`🚀 Health server on port ${PORT}`);
@@ -196,6 +237,7 @@ http.createServer((_req, res) => {
 // ── Start polling ────────────────────────────────────────────────────────────
 console.log(`🔁 Polling Re:amaze brand "${REAMAZE_BRAND}" every ${POLL_INTERVAL_SECONDS}s`);
 console.log(`   Watching for ${BULK_KEYWORDS.length} keywords`);
+console.log(`   Excluding ${EXCLUDED_SUBJECTS.length} subject(s) and ${EXCLUDED_DOMAINS.length} domain(s)`);
 if (SLACK_MENTION_USER_ID) console.log(`   Will @mention: ${SLACK_MENTION_USER_ID}`);
 pollOnce();
 setInterval(pollOnce, POLL_INTERVAL_SECONDS * 1000);
