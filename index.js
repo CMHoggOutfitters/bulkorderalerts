@@ -17,9 +17,21 @@ const SLACK_MENTION_USER_ID  = process.env.SLACK_MENTION_USER_ID;
 const POLL_INTERVAL_SECONDS  = parseInt(process.env.POLL_INTERVAL_SECONDS || "60", 10);
 const PORT                   = process.env.PORT || 3000;
 
-const REQUIRED = { REAMAZE_BRAND, REAMAZE_LOGIN_EMAIL, REAMAZE_API_TOKEN, SLACK_WEBHOOK_URL };
+// Optional: a bot token + channel enables threaded "show more" replies.
+// Incoming webhooks don't return a message timestamp, so threading is impossible
+// with SLACK_WEBHOOK_URL alone — without these two the alert just truncates and
+// points at Re:amaze for the rest.
+const SLACK_BOT_TOKEN        = process.env.SLACK_BOT_TOKEN;
+const SLACK_CHANNEL_ID       = process.env.SLACK_CHANNEL_ID;
+const CAN_THREAD             = !!(SLACK_BOT_TOKEN && SLACK_CHANNEL_ID);
+
+const REQUIRED = { REAMAZE_BRAND, REAMAZE_LOGIN_EMAIL, REAMAZE_API_TOKEN };
 for (const [k, v] of Object.entries(REQUIRED)) {
   if (!v) { console.error(`❌ Missing required env var: ${k}`); process.exit(1); }
+}
+if (!SLACK_WEBHOOK_URL && !CAN_THREAD) {
+  console.error("❌ Need SLACK_WEBHOOK_URL, or SLACK_BOT_TOKEN + SLACK_CHANNEL_ID");
+  process.exit(1);
 }
 
 // ── Tag that flags a conversation as a confirmed bulk lead ───────────────────
@@ -27,6 +39,12 @@ for (const [k, v] of Object.entries(REQUIRED)) {
 // inquiry. Every subsequent customer reply on that conversation will alert
 // Slack, even without bulk keywords.
 const CONFIRMED_BULK_TAG = "confirmed-bulk";
+
+// ── Message display limits ───────────────────────────────────────────────────
+// The channel message shows the first few lines; the rest goes to the thread.
+const PREVIEW_MAX_LINES = 3;
+const PREVIEW_MAX_CHARS = 280;
+const SLACK_TEXT_LIMIT  = 2900; // Slack section limit is 3000 — leave headroom
 
 // ── Bulk keywords (case-insensitive substring match) ─────────────────────────
 const BULK_KEYWORDS = [
@@ -142,6 +160,89 @@ function getExclusionReason(message) {
   return null;
 }
 
+// ── Message formatting ───────────────────────────────────────────────────────
+// Strip HTML, decode the entities Re:amaze commonly emits, and collapse the
+// runs of blank lines that email signatures leave behind.
+function cleanBody(raw) {
+  return String(raw || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// First few lines only, with a hard character cap as a backstop for long
+// single-line messages. Returns whether anything was cut.
+function truncateForSlack(text) {
+  const lines = text.split("\n");
+
+  // Blank lines don't count toward the limit — a paragraph break shouldn't eat
+  // one of the three lines we're showing.
+  let kept = 0, cut = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim()) kept++;
+    if (kept >= PREVIEW_MAX_LINES) { cut = i + 1; break; }
+  }
+
+  let out = lines.slice(0, cut).join("\n");
+  let truncated = cut < lines.length && lines.slice(cut).some(l => l.trim());
+
+  if (out.length > PREVIEW_MAX_CHARS) {
+    out = out.slice(0, PREVIEW_MAX_CHARS).replace(/\s+\S*$/, "");
+    truncated = true;
+  }
+  return { preview: out.trimEnd(), truncated };
+}
+
+function blockquote(text) {
+  return text.split("\n").map(l => `>${l}`).join("\n");
+}
+
+// ── Slack transport ──────────────────────────────────────────────────────────
+// With a bot token we use chat.postMessage, which returns the message `ts` we
+// need to thread the full text under it. With an incoming webhook we can only
+// fire and forget — no ts, so no thread.
+async function postToSlack(payload, { threadTs } = {}) {
+  if (CAN_THREAD) {
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({
+        channel: SLACK_CHANNEL_ID,
+        ...payload,
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) {
+      console.error(`❌ Slack chat.postMessage failed: ${data.error || res.status}`);
+      return null;
+    }
+    return data.ts || null;
+  }
+
+  const res = await fetch(SLACK_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    console.error(`❌ Slack webhook ${res.status}:`, await res.text());
+  }
+  return null;
+}
+
 // ── Slack alert ──────────────────────────────────────────────────────────────
 async function sendSlackAlert({ message, matchedKeywords, reason }) {
   const conv = message.conversation || {};
@@ -153,59 +254,98 @@ async function sendSlackAlert({ message, matchedKeywords, reason }) {
   const conversationUrl = slug
     ? `https://${REAMAZE_BRAND}.reamaze.com/admin/conversations/${slug}`
     : `https://${REAMAZE_BRAND}.reamaze.com`;
-  const body = (message.body || "").replace(/<[^>]+>/g, "");
-  const preview = body.length > 400 ? body.slice(0, 397) + "..." : body;
+
+  const body = cleanBody(message.body);
+  const { preview, truncated } = truncateForSlack(body);
 
   const mention = buildMentionPrefix();
   const isConfirmed = reason === "confirmed-bulk-tag";
   const headerText = isConfirmed ? "⭐ Confirmed Bulk Lead — New Reply" : "🚨 Bulk Order Inquiry";
-  const triggerLine = isConfirmed
-    ? `*Trigger:*\nConversation tagged \`${CONFIRMED_BULK_TAG}\` — every reply now alerts`
-    : `*Keywords:*\n${(matchedKeywords || []).map(k => `\`${k}\``).join(", ")}`;
 
-  const payload = {
-    text: `${mention}${isConfirmed ? "⭐" : "🚨"} ${headerText}`,
-    blocks: [
-      ...(mention ? [{
-        type: "section",
-        text: { type: "mrkdwn", text: `${mention.trim()} 👈 heads up!` },
-      }] : []),
-      { type: "header", text: { type: "plain_text", text: headerText, emoji: true } },
-      {
-        type: "section",
-        fields: [
-          { type: "mrkdwn", text: `*Customer:*\n${customerName}` },
-          { type: "mrkdwn", text: `*Email:*\n${customerEmail}` },
-          { type: "mrkdwn", text: `*Subject:*\n${subject}` },
-          { type: "mrkdwn", text: triggerLine },
-        ],
-      },
-      {
-        type: "section",
-        text: { type: "mrkdwn", text: `*Message preview:*\n>${preview.replace(/\n/g, "\n>")}` },
-      },
-      {
-        type: "actions",
-        elements: [{
-          type: "button",
-          text: { type: "plain_text", text: "Open in Re:amaze →", emoji: true },
-          url: conversationUrl,
-          style: "primary",
-        }],
-      },
-    ],
-  };
+  const blocks = [];
 
-  const res = await fetch(SLACK_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    console.error(`❌ Slack webhook ${res.status}:`, await res.text());
-  } else {
-    console.log("✅ Slack alert sent");
+  if (mention) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `${mention.trim()} 👈 heads up!` },
+    });
   }
+
+  blocks.push({ type: "header", text: { type: "plain_text", text: headerText, emoji: true } });
+
+  // Subject sits directly above the message it belongs to.
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `*Subject:* ${subject}` },
+  });
+
+  // Then the message itself — first few lines, rest in thread.
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: blockquote(preview || "_(no message text)_") },
+  });
+
+  if (truncated) {
+    blocks.push({
+      type: "context",
+      elements: [{
+        type: "mrkdwn",
+        text: CAN_THREAD
+          ? "_Show more ↓ — full message in thread_"
+          : "_Show more — open in Re:amaze for the full message_",
+      }],
+    });
+  }
+
+  // Who it's from sits below the message.
+  blocks.push({
+    type: "section",
+    fields: [
+      { type: "mrkdwn", text: `*Customer:*\n${customerName}` },
+      { type: "mrkdwn", text: `*Email:*\n${customerEmail}` },
+    ],
+  });
+
+  if (isConfirmed) {
+    blocks.push({
+      type: "context",
+      elements: [{
+        type: "mrkdwn",
+        text: `Tagged \`${CONFIRMED_BULK_TAG}\` — every reply on this conversation alerts`,
+      }],
+    });
+  }
+
+  blocks.push({
+    type: "actions",
+    elements: [{
+      type: "button",
+      text: { type: "plain_text", text: "Open in Re:amaze →", emoji: true },
+      url: conversationUrl,
+      style: "primary",
+    }],
+  });
+
+  const ts = await postToSlack({
+    text: `${mention}${headerText} — ${customerName}`,
+    blocks,
+  });
+
+  // Threaded full message. Only possible on the bot-token path.
+  if (ts && truncated) {
+    const full = body.length > SLACK_TEXT_LIMIT
+      ? body.slice(0, SLACK_TEXT_LIMIT) + "\n… (trimmed — open in Re:amaze for the rest)"
+      : body;
+    await postToSlack({
+      text: "Full message",
+      blocks: [{
+        type: "section",
+        text: { type: "mrkdwn", text: `*Full message*\n${blockquote(full)}` },
+      }],
+    }, { threadTs: ts });
+  }
+
+  if (ts || !CAN_THREAD) console.log("✅ Slack alert sent");
 }
 
 // ── Main poll loop ───────────────────────────────────────────────────────────
@@ -285,6 +425,7 @@ http.createServer((_req, res) => {
     seenIds: seenMessageIds.size,
     pollIntervalSeconds: POLL_INTERVAL_SECONDS,
     mentionConfigured: !!SLACK_MENTION_USER_ID,
+    threadedFullMessage: CAN_THREAD,
     excludedSubjects: EXCLUDED_SUBJECTS.length,
     excludedDomains: EXCLUDED_DOMAINS.length,
     confirmedBulkTag: CONFIRMED_BULK_TAG,
@@ -298,6 +439,9 @@ console.log(`🔁 Polling Re:amaze brand "${REAMAZE_BRAND}" every ${POLL_INTERVA
 console.log(`   Watching for ${BULK_KEYWORDS.length} keywords`);
 console.log(`   Excluding ${EXCLUDED_SUBJECTS.length} subject(s) and ${EXCLUDED_DOMAINS.length} domain(s)`);
 console.log(`   Confirmed-bulk tag: "${CONFIRMED_BULK_TAG}"`);
+console.log(CAN_THREAD
+  ? `   Posting via chat.postMessage to ${SLACK_CHANNEL_ID} — full message goes in thread`
+  : `   Posting via incoming webhook — no thread, long messages truncate`);
 if (SLACK_MENTION_USER_ID) console.log(`   Will @mention: ${SLACK_MENTION_USER_ID}`);
 pollOnce();
 setInterval(pollOnce, POLL_INTERVAL_SECONDS * 1000);
